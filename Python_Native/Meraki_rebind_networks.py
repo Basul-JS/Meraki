@@ -18,13 +18,21 @@
     # Update error handling for org networks fetch to save details and abort on unexpected responses
     # adding helpful CLI hints for debugging API issues
     # removal of Dry RUN mode - all actions are live
-
+# 20260114 - Script updated 
+    # Centralised retry helper
+    # Per-device retry counters
+    #  Rollback VLAN restore with backoff
+    # Removed the duplicate / conflicting flatten prompt
+    # Only allows VLAN swap later when flatten was explicitly requested
+    # 
+    
+    
 """
 Meraki Rebind Networks Utility
-Version: 2025.12.19_01
+Version: 2026.01.14_01
 """
 
-SCRIPT_VERSION = "2025.12.19_01"
+SCRIPT_VERSION = "2026.01.14_01"
 
 import requests
 import logging
@@ -37,6 +45,7 @@ import os
 import time
 import signal
 import sys
+import random
 import unicodedata
 from typing import Any, Dict, List, Optional, Tuple, Set, Union, Callable, cast
 from openpyxl import Workbook
@@ -539,6 +548,123 @@ def put_device_with_transient_404_retry(
 def get_inventory_device(org_id: str, serial: str) -> Dict[str, Any]:
     """Single, consistent inventory lookup endpoint."""
     return meraki_get(f"/organizations/{org_id}/inventory/devices/{serial}") or {}
+
+# -------------------------
+# Centralised retry helper
+# -------------------------
+
+@dataclass
+class RetryOutcome:
+    ok: bool
+    attempts: int
+    error_type: Optional[str] = None
+    error: Optional[str] = None
+    http_status: Optional[int] = None
+    last_response_text: Optional[str] = None
+
+def _is_retryable_http_status(status: Optional[int]) -> bool:
+    # Meraki transient-ish statuses (besides 429 which your _request already handles)
+    return status in {408, 409, 500, 502, 503, 504}
+
+def retry_with_backoff(
+    op_name: str,
+    fn: Callable[[], Any],
+    *,
+    max_attempts: int = 6,
+    base_sleep: float = 1.0,
+    max_sleep: float = 15.0,
+    retry_on_http_statuses: Optional[Set[int]] = None,
+    retry_on_exceptions: Tuple[type, ...] = (requests.exceptions.RequestException,),
+    verbose: bool = False,
+) -> RetryOutcome:
+    """
+    Central retry wrapper used across the script.
+
+    - Retries on retryable HTTP statuses (default: 408/409/5xx)
+    - Retries on selected transient exception classes
+    """
+
+    if retry_on_http_statuses is None:
+        retry_on_http_statuses = {408, 409, 500, 502, 503, 504}
+
+    sleep_s = base_sleep
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            fn()
+            return RetryOutcome(ok=True, attempts=attempt)
+
+        except requests.exceptions.HTTPError as e:
+            last_exc = e
+            resp = e.response
+            status = resp.status_code if resp is not None else None
+            text = (resp.text or "")[:500] if resp is not None else None
+
+            if status in retry_on_http_statuses and attempt < max_attempts:
+                logging.warning(
+                    "[%s] HTTP %s on attempt %d/%d. Backing off %.1fs.",
+                    op_name, status, attempt, max_attempts, sleep_s
+                )
+                if verbose:
+                    print(
+                        f"⚠️  {op_name}: HTTP {status} "
+                        f"(attempt {attempt}/{max_attempts}) retrying in {sleep_s:.1f}s"
+                    )
+                time.sleep(sleep_s)
+                sleep_s = min(sleep_s * 2, max_sleep)
+                continue
+
+            return RetryOutcome(
+                ok=False,
+                attempts=attempt,
+                error_type=type(e).__name__,
+                error=str(e),
+                http_status=status,
+                last_response_text=text,
+            )
+
+        except Exception as e:
+            last_exc = e
+
+            # ✅ runtime filter for retryable exception types
+            if isinstance(e, retry_on_exceptions) and attempt < max_attempts:
+                logging.warning(
+                    "[%s] %s on attempt %d/%d. Backing off %.1fs.",
+                    op_name, type(e).__name__, attempt, max_attempts, sleep_s
+                )
+                if verbose:
+                    print(
+                        f"⚠️  {op_name}: {type(e).__name__} "
+                        f"(attempt {attempt}/{max_attempts}) retrying in {sleep_s:.1f}s"
+                    )
+                time.sleep(sleep_s)
+                sleep_s = min(sleep_s * 2, max_sleep)
+                continue
+
+            # Non-retryable OR max attempts reached
+            return RetryOutcome(
+                ok=False,
+                attempts=attempt,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+
+    # Safety net (should never hit)
+    return RetryOutcome(
+        ok=False,
+        attempts=max_attempts,
+        error_type=type(last_exc).__name__ if last_exc else None,
+        error=str(last_exc) if last_exc else None,
+    )
+
+
+def _write_json_log(path: str, payload: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    JSON_DEBUG_FILES_CREATED.append(os.path.abspath(path))
+
 
 # # ======================================================
 # # ------------- Wireless pre-check helpers -------------
@@ -1687,7 +1813,17 @@ def ensure_primary_mx(network_id: str, desired_primary_serial: Optional[str]) ->
             return
 
         print(f"🔁 Swapping warm spare primary to {desired_primary_serial} ...")
-        do_action(meraki_post, f"/networks/{network_id}/appliance/warmSpare/swap")
+        out = retry_with_backoff(
+            "warmspare_swap",
+            lambda: do_action(meraki_post, f"/networks/{network_id}/appliance/warmSpare/swap"),
+            max_attempts=4,
+            base_sleep=2.0,
+            max_sleep=15.0,
+            verbose=True,
+        )
+        if not out.ok:
+            raise RuntimeError(f"Warm spare swap failed after {out.attempts} attempts: {out.error}")
+
         log_change('mx_warmspare_swap',
                    f"Swapped warm spare primary to {desired_primary_serial}",
                    device_serial=desired_primary_serial,
@@ -1711,103 +1847,175 @@ def name_and_configure_claimed_devices(
     primary_mx_serial: Optional[str] = None,
     mr_order: Optional[List[str]] = None,
     ms_order: Optional[List[str]] = None,
-):
+) -> None:
     """
     Renames and configures newly-claimed devices using optional ordering.
-    """
-    prefix = '-'.join(network_name.split('-')[:2]).lower()
-    counts = {'MX': 1, 'MR': 1, 'MS': 1}
-    old_mr33s = sorted([d for d in (old_mr_devices or []) if d['model'] == 'MR33'], key=lambda x: x.get('name', ''))
-    old_mxs_sorted = sorted((old_mx_devices or []) if old_mx_devices else [], key=lambda x: x.get('name', ''))
 
+    Enhancements:
+      - Per-device retry counters (central retry helper)
+      - Summary of failed devices (console + JSON)
+    """
+    prefix = "-".join(network_name.split("-")[:2]).lower()
+    counts: Dict[str, int] = {"MX": 1, "MR": 1, "MS": 1}
+
+    old_mr33s = sorted(
+        [d for d in (old_mr_devices or []) if d.get("model") == "MR33"],
+        key=lambda x: str(x.get("name", "")),
+    )
+    old_mxs_sorted = sorted(
+        (old_mx_devices or []),
+        key=lambda x: str(x.get("name", "")),
+    )
+
+    # ---------------- Inventory cache ----------------
     inv_by_serial: Dict[str, Dict[str, Any]] = {}
     for s in serials:
         try:
-            inv_by_serial[s] = get_inventory_device(org_id, s)
+            inv_by_serial[s] = get_inventory_device(org_id, s) or {}
         except Exception:
-            logging.exception(f"Failed inventory lookup for {s}")
+            logging.exception("Failed inventory lookup for %s", s)
             inv_by_serial[s] = {}
 
-    mx_serials = [s for s in serials if (inv_by_serial.get(s, {}).get('model') or '').upper().startswith('MX')]
-    mr_serials = [
-        s for s in serials
-        if _is_wireless_model((inv_by_serial.get(s, {}).get('model') or '').upper())
-    ]
-    logging.debug(f"APs to configure: {[(s, inv_by_serial.get(s, {}).get('model')) for s in mr_serials]}")
-    ms_serials = [s for s in serials if (inv_by_serial.get(s, {}).get('model') or '').upper().startswith('MS')]
+    # ---------------- Classify devices ----------------
+    mx_serials = [s for s in serials if (inv_by_serial.get(s, {}).get("model") or "").upper().startswith("MX")]
+    mr_serials = [s for s in serials if _is_wireless_model((inv_by_serial.get(s, {}).get("model") or "").upper())]
+    ms_serials = [s for s in serials if (inv_by_serial.get(s, {}).get("model") or "").upper().startswith("MS")]
 
+    # ---------------- Ordering ----------------
     if primary_mx_serial and primary_mx_serial in mx_serials:
         mx_serials = [primary_mx_serial] + [s for s in mx_serials if s != primary_mx_serial]
-
     if mr_order:
         mr_serials = [s for s in mr_order if s in mr_serials]
     if ms_order:
         ms_serials = [s for s in ms_order if s in ms_serials]
 
-    # --- MX ---
+    # ---------------- Profile selection ----------------
+    default_profile_name: Optional[str] = ms_list[0].get("switchProfileName") if ms_list else None
+    default_profile_id: Optional[str] = tpl_profile_map.get(default_profile_name) if default_profile_name else None
+
+    # ---------------- Tracking / summaries ----------------
+    per_device_attempts: Dict[str, int] = {}
+    failed_devices: Dict[str, Dict[str, Any]] = {}  # serial -> {model, role, error...}
+
+    def _record_failure(serial: str, *, role: str, model: str, outcome: RetryOutcome, payload: Dict[str, Any]) -> None:
+        failed_devices[serial] = {
+            "serial": serial,
+            "role": role,
+            "model": model,
+            "attempts": outcome.attempts,
+            "error_type": outcome.error_type,
+            "error": outcome.error,
+            "http_status": outcome.http_status,
+            "last_response_text": outcome.last_response_text,
+            "payload": payload,
+        }
+
+    def _configure_one(serial: str, payload: Dict[str, Any], *, role: str) -> None:
+        model = str(inv_by_serial.get(serial, {}).get("model") or "")
+        op_name = f"configure_{role}_{serial}"
+
+        def _op() -> None:
+            # Use your eventual-consistency aware function; it may raise.
+            put_device_with_transient_404_retry(org_id, serial, payload)
+
+        outcome = retry_with_backoff(op_name, _op, max_attempts=5, base_sleep=1.0, max_sleep=10.0)
+        per_device_attempts[serial] = outcome.attempts
+
+        if outcome.ok:
+            log_change(
+                "device_update",
+                f"Renamed and reconfigured device {serial} ({model})",
+                device_serial=serial,
+                device_name=str(payload.get("name") or ""),
+                misc=f"attempts={outcome.attempts} payload={json.dumps(payload)}",
+                network_id=network_id,
+                network_name=network_name,
+            )
+        else:
+            logging.error("Failed configuring %s (%s) role=%s after %d attempts: %s",
+                          serial, model, role, outcome.attempts, outcome.error)
+            _record_failure(serial, role=role, model=model, outcome=outcome, payload=payload)
+
+    # ==================================================
+    # MX
+    # ==================================================
     mx_idx = 0
     for s in mx_serials:
-        mdl = (inv_by_serial.get(s, {}).get('model') or '')
-        data: Dict[str, Any] = {}
-        data['name'] = f"{prefix}-mx-{counts['MX']:02}"
-        if mx_idx < len(old_mxs_sorted):
-            data['address'] = old_mxs_sorted[mx_idx].get('address', '')
-            data['tags'] = old_mxs_sorted[mx_idx].get('tags', [])
-        else:
-            data['address'] = ''
-            data['tags'] = []
-        mx_idx += 1
-        counts['MX'] += 1
-        try:
-            put_device_with_transient_404_retry(org_id, s, data)
-            log_change('device_update', f"Renamed and reconfigured device {s} ({mdl})",
-                       device_serial=s, device_name=data.get('name', ''),
-                       misc=f"tags={data.get('tags', [])}, address={data.get('address', '')}")
-        except requests.exceptions.HTTPError as e:
-            resp = e.response
-            status = resp.status_code if resp is not None else "?"
-            text = (resp.text or "")[:300] if resp is not None else ""
-            logging.error("Failed configuring %s (%s). HTTP %s %s", s, mdl, status, text)
-        except Exception:
-            logging.exception(f"Failed configuring {s} (MX)")
+        payload: Dict[str, Any] = {"name": f"{prefix}-mx-{counts['MX']:02}"}
 
-    # --- MR ---
+        if mx_idx < len(old_mxs_sorted):
+            payload["address"] = old_mxs_sorted[mx_idx].get("address", "") or ""
+            payload["tags"] = old_mxs_sorted[mx_idx].get("tags", []) or []
+        else:
+            payload["address"] = ""
+            payload["tags"] = []
+
+        mx_idx += 1
+        counts["MX"] += 1
+        _configure_one(s, payload, role="MX")
+
+    # ==================================================
+    # MR
+    # ==================================================
     ap_idx = 0
     for s in mr_serials:
-        mdl = (inv_by_serial.get(s, {}).get('model') or '')
-        data: Dict[str, Any] = {'name': f"{prefix}-ap-{counts['MR']:02}"}
-        if ap_idx < len(old_mr33s):
-            data['tags'] = old_mr33s[ap_idx].get('tags', [])
-            data['address'] = old_mr33s[ap_idx].get('address', '')
-        else:
-            data['tags'] = []
-            data['address'] = ''
-        ap_idx += 1
-        counts['MR'] += 1
-        try:
-            put_device_with_transient_404_retry(org_id, s, data)
-            log_change('device_update', f"Renamed and reconfigured device {s} ({mdl})",
-                       device_serial=s, device_name=data.get('name', ''),
-                       misc=f"tags={data.get('tags', [])}, address={data.get('address', '')}")
-        except Exception:
-            logging.exception(f"Failed configuring {s} (MR)")
+        payload = {"name": f"{prefix}-ap-{counts['MR']:02}"}
 
-    # --- MS ---
+        if ap_idx < len(old_mr33s):
+            payload["tags"] = old_mr33s[ap_idx].get("tags", []) or []
+            payload["address"] = old_mr33s[ap_idx].get("address", "") or ""
+        else:
+            payload["tags"] = []
+            payload["address"] = ""
+
+        ap_idx += 1
+        counts["MR"] += 1
+        _configure_one(s, payload, role="MR")
+
+    # ==================================================
+    # MS
+    # ==================================================
     for s in ms_serials:
-        mdl = (inv_by_serial.get(s, {}).get('model') or '')
-        data: Dict[str, Any] = {'name': f"{prefix}-sw-{counts['MS']:02}"}
-        counts['MS'] += 1
-        prof_name = ms_list[0].get('switchProfileName') if ms_list else None
-        prof_id = tpl_profile_map.get(prof_name) if prof_name else None
-        if prof_id:
-            data['switchProfileId'] = prof_id
-        try:
-            put_device_with_transient_404_retry(org_id, s, data)
-            log_change('device_update', f"Renamed and reconfigured device {s} ({mdl})",
-                       device_serial=s, device_name=data.get('name', ''),
-                       misc=f"tags={data.get('tags', [])}, address={data.get('address', '')}")
-        except Exception:
-            logging.exception(f"Failed configuring {s} (MS)")
+        payload: Dict[str, Any] = {"name": f"{prefix}-sw-{counts['MS']:02}"}
+        counts["MS"] += 1
+
+        if default_profile_id:
+            payload["switchProfileId"] = default_profile_id
+
+        _configure_one(s, payload, role="MS")
+
+    # ---------------- Final summary ----------------
+    summary = {
+        "timestamp": datetime.now().isoformat(),
+        "org_id": org_id,
+        "network_id": network_id,
+        "network_name": network_name,
+        "total_devices": len(serials),
+        "attempts_by_serial": per_device_attempts,
+        "failed_devices": failed_devices,
+    }
+
+    try:
+        path = os.path.join("logs", f"device_config_summary_{org_id}_{network_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        _write_json_log(path, summary)
+        logging.info("Wrote device config summary JSON: %s", path)
+        if DEBUG_MODE:
+            print(f"📝 Device config summary saved: {path}")
+    except Exception:
+        logging.exception("Failed writing device config summary JSON")
+
+    if failed_devices:
+        print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print("❌ Device Configuration Failures")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        for serial, info in failed_devices.items():
+            role = info.get("role")
+            model = info.get("model")
+            attempts = info.get("attempts")
+            status = info.get("http_status")
+            err = info.get("error")
+            print(f"- {serial} ({model}) role={role} attempts={attempts} http={status} err={err}")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 
 def enable_mx_wan2(serial: str) -> bool:
     """
@@ -1838,7 +2046,17 @@ def enable_mx_wan2(serial: str) -> bool:
         payload = {"wan2": {"enabled": True}}
 
     try:
-        do_action(meraki_put, path, data=payload)
+        out = retry_with_backoff(
+            f"enable_wan2_{serial}",
+            lambda: do_action(meraki_put, path, data=payload),
+            max_attempts=4,
+            base_sleep=1.0,
+            max_sleep=10.0,
+            verbose=False,
+        )
+        if not out.ok:
+            raise requests.exceptions.HTTPError(out.error)
+
         log_change(
             "mx_wan2_enable",
             "Enabled WAN2 on MX",
@@ -2219,179 +2437,137 @@ def list_and_rebind_template(
     mx_model_filter: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str], bool, bool]:
     """
-    Interactive template selector that:
-      - shows the number of networks bound to each template
-      - only lists templates with < 90 networks bound
-      - preserves existing VLAN-based suggestion behavior
-      - for 4 VLANs, excludes 'NO LEGACY ... MX' and '3 X DATA VLAN ... MX75' templates
-
-    NEW:
-      - If current bound template is 'GBR-CT-CloudStore-***':
-          - Ask if operator wants to FLATTEN / standardise the network.
-          - If yes, only show templates 'GBR-CT-CloudStore-PreSCE-***-MX75'
-            for the same store code (***).
-      - Returns an extra bool flag:
-          cloudstore_presce_flow = True if we selected a PreSCE MX75 template
-          as part of this flatten/standardise path.
-    Returns: (new_template_id, new_template_name, rollback_triggered, cloudstore_presce_flow)
+    Returns:
+      (new_template_id, new_template_name, rollback_triggered, cloudstore_presce_flow)
     """
     skip_attempts = 0
     cloudstore_presce_flow = False
 
-    # Fetch all templates
-    all_templates_raw: Any = meraki_get(f"/organizations/{org_id}/configTemplates")
-    all_templates: List[Dict[str, Any]] = all_templates_raw if isinstance(all_templates_raw, list) else []
+    # ------------------------------------------------------------------
+    # Fetch templates and bound counts
+    # ------------------------------------------------------------------
+    all_templates_raw = meraki_get(f"/organizations/{org_id}/configTemplates")
+    all_templates: List[Dict[str, Any]] = (
+        all_templates_raw if isinstance(all_templates_raw, list) else []
+    )
 
-    # Pre-compute all counts once (fast lookup for each template)
     all_counts = _template_counts_for_org(org_id)
 
-    eligible: List[Dict[str, Any]] = []   # known counts < 90
-    unknown: List[Dict[str, Any]] = []    # templates without a count (unlikely), keep as unknown
+    eligible: List[Dict[str, Any]] = []
+    unknown: List[Dict[str, Any]] = []
 
     for t in all_templates:
         tid = t.get("id")
         if not tid:
             continue
 
-        bound_count = all_counts.get(tid)
-        if bound_count is None:
-            t2 = dict(t)
-            t2["_boundCount"] = None
-            unknown.append(t2)
-            continue
+        cnt = all_counts.get(tid)
+        t2 = dict(t)
+        t2["_boundCount"] = cnt
 
-        if bound_count < 90:
-            t2 = dict(t)
-            t2["_boundCount"] = bound_count
+        if cnt is None:
+            unknown.append(t2)
+        elif cnt < 90:
             eligible.append(t2)
 
-    # If we have no eligible ones, fall back to unknown list (so the menu isn't empty)
     if not eligible and not unknown:
-        print("ℹ️ No templates available (could not fetch template list).")
+        print("ℹ️ No templates available.")
         return current_id, None, False, False
 
-    if not eligible and unknown:
-        print("⚠️ Could not compute bound counts (or none are under 90). "
-              "Showing templates with unknown counts; they may exceed the 90 limit.")
-        filtered: List[Dict[str, Any]] = unknown[:]
-    else:
-        # Prefer eligible (<90), but also append unknown so you still have options
-        filtered = eligible + unknown
+    filtered = eligible + unknown if eligible else unknown[:]
 
-    # Optional model suffix filter (MX67/MX75) over the current list
-    if mx_model_filter in {'MX67', 'MX75'}:
+    # Optional MX model suffix filter
+    if mx_model_filter in {"MX67", "MX75"}:
         suffix = mx_model_filter.upper()
-        subset = [t for t in filtered if (t.get('name') or '').strip().upper().endswith(suffix)]
+        subset = [
+            t for t in filtered
+            if (t.get("name") or "").strip().upper().endswith(suffix)
+        ]
         if subset:
             filtered = subset
         else:
-            print(f"(No templates ending with {suffix} in the current list; "
-                  f"showing all eligible/unknown templates instead.)")
+            print(f"(No templates ending with {suffix}; showing all eligible templates.)")
 
-    # VLAN-based filtering/suggestion
-    vlan_count: Optional[int] = _current_vlan_count(network_id)
-
-    # Resolve current template name once (may be None)
-    current_tpl_name: Optional[str] = _get_template_name(org_id, current_id) if current_id else None
-    # -------- Flatten prompt (store intent for later VLAN update) --------
-    flatten_requested = False
-
+    # ------------------------------------------------------------------
+    # VLAN count + current template name
+    # ------------------------------------------------------------------
+    vlan_count = _current_vlan_count(network_id)
+    current_tpl_name = _get_template_name(org_id, current_id) if current_id else None
     curr_up = (current_tpl_name or "").strip().upper()
 
-    # Disable flatten entirely for EnableMX-Port3 source
+    # ------------------------------------------------------------------
+    # SINGLE flatten decision point (authoritative)
+    # ------------------------------------------------------------------
+    flatten_requested = False
+
     if curr_up.startswith("GBR-CT-CLOUDSTORE-ENABLEMX-PORT3"):
         print("ℹ️ Flatten option disabled: current template is GBR-CT-CloudStore-EnableMX-Port3.")
-    else:
-        # Only offer flatten for classic CloudStore-### sources (NOT PreSCE)
-        if current_tpl_name and re.match(r"^GBR-CT-CloudStore-\d{3}$", current_tpl_name, re.IGNORECASE):
-            flatten_requested = _prompt_yes_no(
-                "Flatten VLANs / standardise the network? (Only swaps VLAN 40/41 if you answer YES)",
-                default_no=True
-            )
+    elif current_tpl_name and re.match(r"^GBR-CT-CloudStore-\d{3}$", current_tpl_name, re.IGNORECASE):
+        flatten_requested = _prompt_yes_no(
+            "Flatten VLANs / standardise the network? "
+            "(Only swaps VLAN 40/41 if you answer YES)",
+            default_no=True,
+        )
 
-    # Persist the operator intent for bind_network_to_template()
+    # Persist operator intent for later VLAN logic
     if _current_checkpoint is not None:
         _current_checkpoint.step_status = _current_checkpoint.step_status or {}
         _current_checkpoint.step_status["flatten_requested"] = bool(flatten_requested)
         _current_checkpoint.save()
 
-    # --- NEW: CloudStore flatten / standardise prompt ---
-    flatten_requested = False
-    presce_target_store_code: Optional[str] = None
-    if current_tpl_name:
-        store_code = _cloudstore_store_code_from_name(current_tpl_name)
-        if store_code:
-            # Only ask once
-            q = (
-                f"\nCurrent template '{current_tpl_name}' is a CloudStore template "
-                f"for store {store_code}.\n"
-                "Would you like to FLATTEN VLAN's / standardise this network using the "
-                "GBR-CT-CloudStore-PreSCE-***-MX75 template? "
-            )
-            flatten_requested = _prompt_yes_no(q, default_no=True)
-            if flatten_requested:
-                presce_target_store_code = store_code
-    
-
-    # If VLAN count is exactly 4, exclude names matching the 3/5-VLAN patterns
+    # ------------------------------------------------------------------
+    # VLAN-count based filtering
+    # ------------------------------------------------------------------
     if vlan_count == 4:
-        rx_no_legacy_mx = re.compile(r'NO\s*LEGACY.*MX(?:\d{2})?\b', re.IGNORECASE)
-        rx_3xdata_mx75 = re.compile(r'3\s*X\s*DATA[_\s-]*VLAN.*MX75\b', re.IGNORECASE)
+        rx_no_legacy = re.compile(r"NO\s*LEGACY.*MX", re.IGNORECASE)
+        rx_3xdata = re.compile(r"3\s*X\s*DATA.*MX75", re.IGNORECASE)
         filtered = [
             t for t in filtered
-            if not rx_no_legacy_mx.search(t.get('name') or '')
-            and not rx_3xdata_mx75.search(t.get('name') or '')
+            if not rx_no_legacy.search(t.get("name") or "")
+            and not rx_3xdata.search(t.get("name") or "")
         ]
         if not filtered:
-            print("⚠️ No templates left after excluding 3/5-VLAN patterns for a 4-VLAN network.")
-            # Nothing to pick from; bail out without changing template.
+            print("⚠️ No templates remain after 4-VLAN filtering.")
             return current_id, None, False, False
 
-        # For 3- or 5-VLAN networks, only show templates in the same "family"
-    # as the currently bound template, UNLESS we are explicitly flattening.
     if vlan_count in (3, 5) and current_tpl_name and not flatten_requested:
-        up_curr = current_tpl_name.upper()
-
-        if "PRESCE" in up_curr:
-            # PreSCE family: require PRESCE in template name
-            narrowed = [
+        up = curr_up
+        if "PRESCE" in up:
+            filtered = [
                 t for t in filtered
-                if "PRESCE" in (t.get('name') or "").upper()
+                if "PRESCE" in (t.get("name") or "").upper()
             ]
         else:
-            # Plain CloudStore family: require CLOUDSTORE but exclude PRESCE
-            narrowed = [
+            filtered = [
                 t for t in filtered
-                if "CLOUDSTORE" in (t.get('name') or "").upper()
-                and "PRESCE" not in (t.get('name') or "").upper()
+                if "CLOUDSTORE" in (t.get("name") or "").upper()
+                and "PRESCE" not in (t.get("name") or "").upper()
             ]
 
-        if narrowed:
-            filtered = narrowed
-
-
-        # --- If flatten requested, restrict to ALL PreSCE MX75 CloudStore templates (< 90 bound) ---
+    # ------------------------------------------------------------------
+    # Flatten restriction: ONLY PreSCE-***-MX75
+    # ------------------------------------------------------------------
     if flatten_requested:
-        presce_filtered: List[Dict[str, Any]] = []
-        for t in filtered:
-            tname = (t.get("name") or "").strip()
-            if PRESCE_MX75_RE.match(tname):
-                presce_filtered.append(t)
-
-        if presce_filtered:
-            filtered = presce_filtered
+        presce = [
+            t for t in filtered
+            if PRESCE_MX75_RE.match((t.get("name") or "").strip())
+        ]
+        if presce:
+            filtered = presce
         else:
-            print(
-                "⚠️ No GBR-CT-CloudStore-PreSCE-***-MX75 templates found under current filters. "
-                "Continuing with normal list."
-            )
-            # fall back to normal behaviour if none exist
+            print("⚠️ No PreSCE-***-MX75 templates found; flatten disabled.")
             flatten_requested = False
+            if _current_checkpoint is not None:
+                _current_checkpoint.step_status = _current_checkpoint.step_status or {}
+                _current_checkpoint.step_status["flatten_requested"] = False
+                _current_checkpoint.save()
 
 
-    # Now compute the suggestion against the final filtered list
+    # ------------------------------------------------------------------
+    # Suggestion logic
+    # ------------------------------------------------------------------
     try:
-        suggested_tpl: Optional[Dict[str, Any]] = _pick_template_by_vlan_count(
+        suggested_tpl = _pick_template_by_vlan_count(
             filtered,
             vlan_count,
             current_template_name=current_tpl_name,
@@ -2400,63 +2576,39 @@ def list_and_rebind_template(
         print(f"❌ {e}")
         suggested_tpl = None
 
-    # Bubble the suggestion to the top if present in the filtered set
-    suggested_id: Optional[str] = suggested_tpl.get('id') if suggested_tpl else None
+    suggested_id = suggested_tpl.get("id") if suggested_tpl else None
     if suggested_id:
-        idset = {t.get('id') for t in filtered}
-        if suggested_id in idset:
-            filtered = [t for t in filtered if t.get('id') == suggested_id] + \
-                       [t for t in filtered if t.get('id') != suggested_id]
-
-    # --- Selection loop ---
-    while True:
-        print(f"\nCurrent network: {network_name} (ID: {network_id})")
-        log_change(
-            'current_network_info',
-            f"Current network: {network_name}",
-            org_id=org_id,
-            network_id=network_id,
-            network_name=network_name,
+        filtered = (
+            [t for t in filtered if t.get("id") == suggested_id]
+            + [t for t in filtered if t.get("id") != suggested_id]
         )
 
-        # Show current bound template (if any)
+    # ------------------------------------------------------------------
+    # Selection loop
+    # ------------------------------------------------------------------
+    while True:
+        print(f"\nCurrent network: {network_name} (ID: {network_id})")
+
         if current_id:
-            curr_name = _get_template_name(org_id, current_id) or "<unknown>"
-            print(f"Bound template: {curr_name} (ID: {current_id})\n")
-            log_change(
-                'bound_template_info',
-                f"Bound template {curr_name} ({current_id})",
-                network_id=network_id,
-                network_name=network_name,
-            )
+            print(f"Bound template: {current_tpl_name} (ID: {current_id})\n")
         else:
             print("No template bound.\n")
 
         print("Available templates (< 90 bound or unknown):")
         for i, t in enumerate(filtered, 1):
-            name = t.get('name', '')
-            tid = t.get('id', '')
-            cnt = t.get('_boundCount', None)
+            cnt = t.get("_boundCount")
             cnt_str = "?" if cnt is None else str(cnt)
-            auto_mark = " [AUTO]" if suggested_id and t.get('id') == suggested_id else ""
-            print(f"{i}. {name}{auto_mark} (ID: {tid}) — {cnt_str} bound")
+            auto = " [AUTO]" if suggested_id == t.get("id") else ""
+            print(f"{i}. {t.get('name','')}{auto} — {cnt_str} bound")
 
-        if suggested_tpl:
-            print(f"\nSuggestion: Based on VLAN count ({vlan_count}), "
-                  f"'{suggested_tpl.get('name')}' looks appropriate.")
-            print("Press 'a' to auto-select the suggested template, or choose a number. "
-                  "Press Enter / type 'skip'/'cancel' to cancel (twice cancels with rollback).")
-
-        sel = input("Select template # (or 'a' to accept suggestion): ").strip().lower()
+        sel = input("Select template # (or 'a' for suggestion): ").strip().lower()
 
         if sel in {"", "skip", "cancel"}:
             skip_attempts += 1
             if skip_attempts == 1:
-                print("⚠️  You chose to cancel template selection.")
-                print("If you cancel again, the process will be ROLLED BACK immediately.")
+                print("⚠️ Cancel again to rollback.")
                 continue
-            print("🚨 Cancelled twice — initiating rollback...")
-            log_change('rollback_trigger', 'User cancelled twice during template selection')
+
             rollback_all_changes(
                 network_id=network_id,
                 pre_change_devices=pre_change_devices or [],
@@ -2472,27 +2624,19 @@ def list_and_rebind_template(
 
         if sel == "a" and suggested_tpl:
             chosen = suggested_tpl
+        elif sel.isdigit() and 1 <= int(sel) <= len(filtered):
+            chosen = filtered[int(sel) - 1]
         else:
-            if not sel.isdigit():
-                print("Invalid selection. Enter a number from the list, 'a' for suggestion, or press Enter to cancel.")
-                continue
-            idx = int(sel) - 1
-            if idx < 0 or idx >= len(filtered):
-                print("Invalid template number.")
-                continue
-            chosen = filtered[idx]
+            print("Invalid selection.")
+            continue
 
-        if chosen['id'] == current_id:
-            print("No change (already bound to that template).")
-            return current_id, chosen['name'], False, False
+        if chosen["id"] == current_id:
+            print("No change.")
+            return current_id, chosen.get("name"), False, False
 
-        # Detect if this choice is the CloudStore PreSCE MX75 template for flatten
-        try:
-            chosen_name = (chosen.get("name") or "").strip()
-            if flatten_requested and PRESCE_MX75_RE.match(chosen_name):
-                cloudstore_presce_flow = True
-        except Exception:
-            logging.exception("Failed evaluating CloudStore PreSCE flow flag")
+        chosen_name = (chosen.get("name") or "").strip()
+        if flatten_requested and PRESCE_MX75_RE.match(chosen_name):
+            cloudstore_presce_flow = True
 
         try:
             if current_id:
@@ -2500,68 +2644,29 @@ def list_and_rebind_template(
             do_action(
                 meraki_post,
                 f"/networks/{network_id}/bind",
-                data={"configTemplateId": chosen['id']},
+                data={"configTemplateId": chosen["id"]},
             )
-            # Invalidate org-level caches after a (re)bind, so later views are fresh
+
             _ORG_NETWORKS_CACHE.pop(org_id, None)
             _TEMPLATE_COUNT_CACHE.pop(org_id, None)
 
-            log_change(
-                'template_bind',
-                f"Bound to template {chosen.get('name')} (ID: {chosen.get('id')})",
-                device_name=network_name,
-                network_id=network_id,
-                network_name=network_name,
-            )
-            print(f"✅ Bound to {chosen.get('name')}")
-            return chosen['id'], chosen.get('name'), False, cloudstore_presce_flow
-
-        except requests.exceptions.HTTPError as e:
-            logging.error("Error binding template: %s", e)
-            must_rollback = bool(current_id)
-            if is_vlans_disabled_error(e):
-                print("❌ VLANs are not enabled for this network. Binding failed and state may be partial.")
-                must_rollback = True
-
-            if must_rollback:
-                print("🚨 Initiating rollback due to failed bind...")
-                rollback_all_changes(
-                    network_id=network_id,
-                    pre_change_devices=pre_change_devices or [],
-                    pre_change_vlans=pre_change_vlans or [],
-                    pre_change_template=pre_change_template,
-                    org_id=org_id,
-                    claimed_serials=claimed_serials or [],
-                    removed_serials=removed_serials or [],
-                    ms_list=ms_list or [],
-                    network_name=network_name,
-                )
-                return current_id, None, True, False
-
-            print(f"❌ Failed to bind template: {e}. You can try again or cancel.")
-            continue
+            print(f"✅ Bound to {chosen_name}")
+            return chosen["id"], chosen_name, False, cloudstore_presce_flow
 
         except Exception as e:
-            logging.error(f"Unexpected error during bind: {e}")
-            if current_id:
-                print("🚨 Unexpected error after unbind — initiating rollback...")
-                rollback_all_changes(
-                    network_id=network_id,
-                    pre_change_devices=pre_change_devices or [],
-                    pre_change_vlans=pre_change_vlans or [],
-                    pre_change_template=pre_change_template,
-                    org_id=org_id,
-                    claimed_serials=claimed_serials or [],
-                    removed_serials=removed_serials or [],
-                    ms_list=ms_list or [],
-                    network_name=network_name,
-                )
-                return current_id, None, True, False
-            print(f"❌ Unexpected error: {e}. You can try again or cancel.")
-            continue
-
-    # Safety net for type checkers; execution should never reach here.
-    return current_id, None, False, False
+            logging.exception("Template bind failed")
+            rollback_all_changes(
+                network_id=network_id,
+                pre_change_devices=pre_change_devices or [],
+                pre_change_vlans=pre_change_vlans or [],
+                pre_change_template=pre_change_template,
+                org_id=org_id,
+                claimed_serials=claimed_serials or [],
+                removed_serials=removed_serials or [],
+                ms_list=ms_list or [],
+                network_name=network_name,
+            )
+            return current_id, None, True, False
 
 def _current_vlan_count(network_id: str) -> Optional[int]:
     vlans = fetch_vlan_details(network_id)
@@ -2844,6 +2949,7 @@ def select_switch_profile_for_network(
 # =====================
 # Rollback
 # =====================
+
 def rollback_all_changes(
     network_id: str,
     pre_change_devices: List[Dict[str, Any]],
@@ -2855,179 +2961,342 @@ def rollback_all_changes(
     removed_serials: Optional[List[str]] = None,
     ms_list: Optional[List[Dict[str, Any]]] = None,
     network_name: str,
-):
+) -> None:
     """
     Roll back safely:
-      - Only REMOVE devices that were ADDED during this run (not present pre-change).
-      - Never remove MG (cellular gateway) unless it was added during this run.
+      - Only REMOVE devices that were ADDED during this run.
+      - Never remove MG unless it was added during this run.
       - Only RE-ADD devices that were present pre-change and are now missing.
+      - Retry VLAN restore with backoff.
+      - Produce rollback summary JSON.
+      - NEVER crash midway through rollback.
     """
     print("=== Starting rollback to previous network state ===")
 
-     # Build quick lookup sets/maps from pre-change state
-    pre_serials: Set[str] = {d.get("serial", "") for d in pre_change_devices if d.get("serial")}
-    pre_by_serial: Dict[str, Dict[str, Any]] = {d["serial"]: d for d in pre_change_devices if d.get("serial")}
+    rb_failures: List[Dict[str, Any]] = []
+    per_device_attempts: Dict[str, int] = {}
+    failed_devices: Dict[str, List[Dict[str, Any]]] = {}
 
-    # --- Stage 1: Remove devices that were added during this run ---
-    # A device is eligible for removal iff:
-    #   - present in 'claimed_serials' (as given by the workflow)
-    #   - NOT in 'pre_serials' (i.e., it wasn't there pre-change)
-    #   - and is still currently in this network (best-effort check)
-    #   - skip MG unless explicitly added (claim list) and not in pre
-    safe_claimed = list(claimed_serials or [])
-    if safe_claimed:
+    def _stage_fail(stage: str, exc: Exception) -> None:
+        logging.exception("Rollback stage failed: %s", stage)
+        rb_failures.append({
+            "stage": stage,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        })
+
+    def _record_device_failure(
+        serial: str,
+        *,
+        stage: str,
+        outcome: RetryOutcome,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        failed_devices.setdefault(serial, []).append({
+            "serial": serial,
+            "stage": stage,
+            "attempts": outcome.attempts,
+            "error_type": outcome.error_type,
+            "error": outcome.error,
+            "http_status": outcome.http_status,
+            "last_response_text": outcome.last_response_text,
+            "extra": extra or {},
+        })
+
+    # -------------------------------------------------
+    # Build lookup maps
+    # -------------------------------------------------
+    pre_serials: Set[str] = {
+        d.get("serial", "") for d in pre_change_devices if d.get("serial")
+    }
+    pre_by_serial: Dict[str, Dict[str, Any]] = {
+        d["serial"]: d for d in pre_change_devices if d.get("serial")
+    }
+
+    # -------------------------------------------------
+    # Stage 1: Remove devices added during this run
+    # -------------------------------------------------
+    try:
+        safe_claimed = list(claimed_serials or [])
+        current_serials: Set[str] = set()
+
+        if safe_claimed:
+            try:
+                current_devices = meraki_get(f"/networks/{network_id}/devices") or []
+                if isinstance(current_devices, list):
+                    current_serials = {
+                        serial
+                        for d in current_devices
+                        if isinstance(d, dict)
+                        and (serial := d.get("serial")) is not None
+                    }
+            except Exception as e:
+                _stage_fail("fetch_current_devices_before_remove", e)
+
+
+            for serial in safe_claimed:
+                if not serial or serial in pre_serials:
+                    continue
+                if current_serials and serial not in current_serials:
+                    continue
+
+                try:
+                    inv = get_inventory_device(org_id, serial) or {}
+                    model = (inv.get("model") or "").upper()
+                    if model.startswith("MG") and serial in pre_serials:
+                        continue
+                except Exception:
+                    logging.exception(
+                        "Rollback inventory check failed for %s; skipping removal",
+                        serial,
+                    )
+                    continue
+
+                print(f"Removing claimed device: {serial}")
+
+                def _op_remove() -> None:
+                    do_action(
+                        meraki_post,
+                        f"/networks/{network_id}/devices/remove",
+                        data={"serial": serial},
+                    )
+
+                outcome = retry_with_backoff(
+                    f"rollback_remove_{serial}",
+                    _op_remove,
+                    max_attempts=4,
+                    base_sleep=1.0,
+                    max_sleep=10.0,
+                )
+                per_device_attempts[serial] = outcome.attempts
+
+                if outcome.ok:
+                    log_change(
+                        "rollback_device_removed",
+                        "Removed device added during this run",
+                        device_serial=serial,
+                        network_id=network_id,
+                        network_name=network_name,
+                    )
+                else:
+                    _record_device_failure(
+                        serial,
+                        stage="remove_added_device",
+                        outcome=outcome,
+                    )
+    except Exception as e:
+        _stage_fail("stage_1_remove_added_devices", e)
+
+    # -------------------------------------------------
+    # Stage 2: Restore original template
+    # -------------------------------------------------
+    try:
+        print("Restoring config template binding...")
+
+        def _op_unbind() -> None:
+            do_action(meraki_post, f"/networks/{network_id}/unbind")
+
+        out_unbind = retry_with_backoff(
+            "rollback_unbind",
+            _op_unbind,
+            max_attempts=4,
+            base_sleep=1.0,
+            max_sleep=10.0,
+        )
+        if not out_unbind.ok:
+            rb_failures.append({"stage": "unbind", **asdict(out_unbind)})
+
+        if pre_change_template:
+            def _op_bind() -> None:
+                do_action(
+                    meraki_post,
+                    f"/networks/{network_id}/bind",
+                    data={"configTemplateId": pre_change_template},
+                )
+
+            out_bind = retry_with_backoff(
+                "rollback_bind_original_template",
+                _op_bind,
+                max_attempts=4,
+                base_sleep=2.0,
+                max_sleep=15.0,
+            )
+            if not out_bind.ok:
+                rb_failures.append({"stage": "bind_original_template", **asdict(out_bind)})
+
+        log_change(
+            "rollback_template",
+            f"Restored template binding {pre_change_template}",
+            device_name=f"Network: {network_id}",
+            network_id=network_id,
+            network_name=network_name,
+        )
+
+        print("Waiting for template binding to take effect (sleeping 15 seconds)...")
+        time.sleep(15)
+    except Exception as e:
+        _stage_fail("stage_2_restore_template", e)
+
+    # -------------------------------------------------
+    # Stage 3: Re-add devices present pre-change but missing
+    # -------------------------------------------------
+    try:
+        current_serials: Set[str] = set()
         try:
             current_devices = meraki_get(f"/networks/{network_id}/devices") or []
-            current_serials = {d.get("serial") for d in current_devices if d.get("serial")}
-        except Exception:
-            logging.exception("Failed to fetch current devices during rollback; proceeding with cautious removals")
-            current_serials = set()
+            if isinstance(current_devices, list):
+                current_serials = {
+                    serial
+                    for d in current_devices
+                    if isinstance(d, dict)
+                    and (serial := d.get("serial")) is not None
+                }
+        except Exception as e:
+            _stage_fail("fetch_current_devices_after_template", e)
 
-        for serial in safe_claimed:
+        for serial in sorted(pre_serials - current_serials):
             if not serial:
                 continue
-            # Only remove if it was NOT in pre-change snapshot (i.e., added by this run)
-            if serial in pre_serials:
-                continue
-            # Only remove if it's currently in the network (when known)
-            if current_serials and serial not in current_serials:
-                continue
 
-            # Skip MG (cellular gateway) unless it was added by this run (which we already assert above)
-            # Here we still double-check the model to avoid surprises.
             try:
                 inv = get_inventory_device(org_id, serial) or {}
-                model = (inv.get("model") or "").upper()
-                if model.startswith("MG"):
-                    # We skip MG removal to avoid touching existing WAN failover gear.
-                    logging.info("Rollback: skipping removal of MG device %s (model %s)", serial, model)
+                if inv.get("networkId"):
                     continue
             except Exception:
-                # On inventory failure, play it safe: do not remove unless we’re very sure it was added by us
-                logging.exception("Inventory check failed for %s during rollback removal; skipping removal", serial)
+                logging.exception(
+                    "Rollback inventory lookup failed for %s; skipping re-add",
+                    serial,
+                )
                 continue
 
-            print(f"Removing claimed device: {serial}")
-            try:
-                do_action(meraki_post, f"/networks/{network_id}/devices/remove", data={"serial": serial})
-                log_change('rollback_device_removed', "Removed device added during this run", device_serial=serial)
-            except Exception:
-                logging.exception("Failed to remove claimed device %s during rollback", serial)
-
-    # --- Stage 2: Restore original template binding ---
-    print("Restoring config template binding...")
-    try:
-        do_action(meraki_post, f"/networks/{network_id}/unbind")
-        if pre_change_template:
-            do_action(meraki_post, f"/networks/{network_id}/bind", data={"configTemplateId": pre_change_template})
-        log_change('rollback_template', f"Restored template binding {pre_change_template}", device_name=f"Network: {network_id}")
-    except Exception:
-        logging.exception("Failed to restore original template binding")
-
-    print("Waiting for template binding to take effect (sleeping 15 seconds)...")
-    time.sleep(15)
-
-    # --- Stage 3: Re-add devices that were present pre-change but are now missing ---
-    try:
-        current_devices = meraki_get(f"/networks/{network_id}/devices") or []
-        current_serials = {d.get("serial") for d in current_devices if d.get("serial")}
-    except Exception:
-        logging.exception("Failed to fetch current devices after template bind in rollback")
-        current_devices = []
-        current_serials = set()
-
-    # Optionally trust 'removed_serials' if provided, but also scan pre_change_devices to be robust
-    # Only re-add if:
-    #   - the device was in pre_serials
-    #   - currently not in the network
-    #   - and not assigned elsewhere
-    for serial in sorted(pre_serials - current_serials):
-        if not serial:
-            continue
-        try:
-            inv = get_inventory_device(org_id, serial)
-            if inv.get('networkId'):
-                print(f"Device {serial} is currently assigned to another network. Skipping re-add.")
-                continue
             print(f"Re-adding previously present device: {serial}")
-            do_action(meraki_post, f"/networks/{network_id}/devices/claim", data={"serials": [serial]})
-            log_change('rollback_device_readded', "Device re-added during rollback", device_serial=serial)
-        except Exception as e:
-            print(f"Could not check/claim device {serial}: {e}")
 
-    # Re-fetch after re-adding to apply per-device settings
-    try:
-        current_devices = meraki_get(f"/networks/{network_id}/devices") or []
-        current_serials = {d.get("serial") for d in current_devices if d.get("serial")}
-    except Exception:
-        logging.exception("Failed to fetch current devices (post re-add) during rollback")
-        current_devices = []
-        current_serials = set()
+            def _op_claim() -> None:
+                do_action(
+                    meraki_post,
+                    f"/networks/{network_id}/devices/claim",
+                    data={"serials": [serial]},
+                )
 
-    # Fetch switch profiles for restored template (to re-map MS profiles by id/name)
-    try:
-        restored_tpl_profiles = meraki_get(f"/organizations/{org_id}/configTemplates/{pre_change_template}/switch/profiles") if pre_change_template else []
-        profile_id_set = {p['switchProfileId'] for p in (restored_tpl_profiles or [])}
-        profile_name_to_id = {p['name']: p['switchProfileId'] for p in (restored_tpl_profiles or [])}
-    except Exception:
-        logging.exception("Could not fetch switch profiles for restored template (rollback)")
-        restored_tpl_profiles = []
-        profile_id_set = set()
-        profile_name_to_id = {}
-
-    # Restore device metadata (name/address/tags) and MS switchProfileId + port overrides
-    for serial, dev in pre_by_serial.items():
-        if serial not in current_serials:
-            continue
-
-        update_args: Dict[str, Any] = {
-            "name": dev.get("name", ""),
-            "address": dev.get("address", ""),
-            "tags": dev.get("tags", []) if isinstance(dev.get("tags"), list) else (dev.get("tags") or "").split(),
-        }
-
-        # MS profile restoration
-        if str(dev.get("model", "")).upper().startswith("MS"):
-            orig_profile_id = dev.get('switchProfileId')
-            if orig_profile_id and orig_profile_id in profile_id_set:
-                print(f"Auto-restoring MS {serial} to profile ID {orig_profile_id}")
-                update_args["switchProfileId"] = orig_profile_id
-            else:
-                orig_profile_name = dev.get('switchProfileName')
-                new_profile_id = profile_name_to_id.get(orig_profile_name) if orig_profile_name else None
-                if new_profile_id:
-                    print(f"Auto-restoring MS {serial} to profile '{orig_profile_name}' (ID: {new_profile_id})")
-                    update_args["switchProfileId"] = new_profile_id
-
-        try:
-            do_action(meraki_put, f"/devices/{serial}", data=update_args)
-            log_change(
-                'rollback_device_update',
-                "Restored device config during rollback",
-                device_serial=serial,
-                device_name=dev.get('name', ''),
-                misc=f"tags={dev.get('tags', [])}, address={dev.get('address', '')}"
+            outcome = retry_with_backoff(
+                f"rollback_readd_{serial}",
+                _op_claim,
+                max_attempts=4,
+                base_sleep=2.0,
+                max_sleep=15.0,
             )
-        except Exception:
-            logging.exception("Failed to update device %s during rollback", serial)
-            continue
+            per_device_attempts[serial] = max(
+                per_device_attempts.get(serial, 0),
+                outcome.attempts,
+            )
 
-        # Re-apply preserved MS port overrides, if any
-        if str(dev.get("model", "")).upper().startswith("MS"):
-            try:
-                preserved = (dev.get('port_overrides') or {})
-                if preserved:
-                    apply_port_overrides(serial, preserved)
-            except Exception:
-                logging.exception("Failed applying preserved port overrides during rollback for %s", serial)
+            if outcome.ok:
+                log_change(
+                    "rollback_device_readded",
+                    "Device re-added during rollback",
+                    device_serial=serial,
+                    network_id=network_id,
+                    network_name=network_name,
+                )
+            else:
+                _record_device_failure(
+                    serial,
+                    stage="readd_missing_device",
+                    outcome=outcome,
+                )
+    except Exception as e:
+        _stage_fail("stage_3_readd_devices", e)
 
-    # --- Stage 4: Restore VLANs and DHCP assignments ---
-    print("Restoring VLANs and DHCP assignments...")
-    time.sleep(5)
-    update_vlans(network_id, network_name, pre_change_vlans)
-    log_change('rollback_vlans', "Restored VLANs and DHCP assignments", device_name=f"Network: {network_id}")
+    # -------------------------------------------------
+    # Stage 4: Restore VLANs (retry with backoff)
+    # -------------------------------------------------
+    vlan_restore_outcome: Optional[RetryOutcome] = None
+    try:
+        print("Restoring VLANs and DHCP assignments...")
+        time.sleep(5)
+
+        def _op_vlan_restore() -> None:
+            update_vlans(network_id, network_name, pre_change_vlans)
+
+        vlan_restore_outcome = retry_with_backoff(
+            "rollback_vlan_restore",
+            _op_vlan_restore,
+            max_attempts=6,
+            base_sleep=2.0,
+            max_sleep=20.0,
+            verbose=True,
+        )
+
+        if vlan_restore_outcome.ok:
+            log_change(
+                "rollback_vlans",
+                "Restored VLANs and DHCP assignments",
+                device_name=f"Network: {network_id}",
+                network_id=network_id,
+                network_name=network_name,
+            )
+        else:
+            log_change(
+                "rollback_vlans_failed",
+                "Failed restoring VLANs during rollback",
+                device_name=f"Network: {network_id}",
+                network_id=network_id,
+                network_name=network_name,
+            )
+            rb_failures.append({
+                "stage": "vlan_restore",
+                **asdict(vlan_restore_outcome),
+            })
+    except Exception as e:
+        _stage_fail("stage_4_restore_vlans", e)
+
+    # -------------------------------------------------
+    # Write rollback summary JSON
+    # -------------------------------------------------
+    try:
+        summary = {
+            "timestamp": datetime.now().isoformat(),
+            "org_id": org_id,
+            "network_id": network_id,
+            "network_name": network_name,
+            "pre_change_template": pre_change_template,
+            "failures": rb_failures,
+            "failed_devices": failed_devices,
+            "attempts_by_serial": per_device_attempts,
+            "vlan_restore_outcome": asdict(vlan_restore_outcome)
+            if vlan_restore_outcome else None,
+        }
+        rb_path = os.path.join(
+            "logs",
+            f"rollback_summary_{org_id}_{network_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+        )
+        _write_json_log(rb_path, summary)
+        print(f"📝 Rollback summary saved to {rb_path}")
+    except Exception:
+        logging.exception("Failed writing rollback summary JSON")
+
+    # -------------------------------------------------
+    # Console summary
+    # -------------------------------------------------
+    if failed_devices or rb_failures:
+        print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print("⚠️ Rollback Completed With Issues")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        for serial, failures in failed_devices.items():
+            for f in failures:
+                print(
+                    f"  • {serial}: stage={f['stage']} "
+                    f"attempts={f['attempts']} "
+                    f"http={f['http_status']} "
+                    f"err={f['error']}"
+                )
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 
     print("=== Rollback complete ===")
+
+    # -------------------------------------------------
+    # Clear checkpoint (best-effort)
+    # -------------------------------------------------
     global _current_checkpoint
     try:
         cp = _current_checkpoint
@@ -3040,6 +3309,7 @@ def rollback_all_changes(
     except Exception:
         logging.exception("Failed to clear checkpoint after rollback")
 
+
 # =====================
 # Step Summary helpers (✅ / ❌ and skip N/A)
 # =====================
@@ -3051,6 +3321,37 @@ def _fmt(val: StatusVal) -> str:
     if val is False:
         return "❌ Failed"
     return str(val)
+
+def write_run_summary_json(
+    *,
+    org_id: str,
+    network_id: str,
+    network_name: str,
+    step_status: Dict[str, StatusVal],
+    claimed_serials: List[str],
+    removed_serials: List[str],
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(),
+        "org_id": org_id,
+        "network_id": network_id,
+        "network_name": network_name,
+        "step_status": step_status,
+        "vlan_updates": {
+            "ok": sorted(set(VLAN_UPDATES_OK)),
+            "skipped": sorted(set(VLAN_UPDATES_SKIPPED)),
+            "failed": sorted(set(VLAN_UPDATES_FAILED)),
+        },
+        "claimed_serials_delta": claimed_serials,
+        "removed_serials_delta": removed_serials,
+        "extra": extra or {},
+    }
+    path = os.path.join("logs", f"run_summary_{org_id}_{network_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    _write_json_log(path, payload)
+    if DEBUG_MODE:
+        print(f"📝 Run summary saved: {path}")
+
 
 def print_summary(step_status: Dict[str, StatusVal]) -> None:
     order = [
@@ -3677,12 +3978,32 @@ if __name__ == '__main__':
                     try:
                         new_template = suggested_tpl.get('id')
                         if old_template:
-                            do_action(meraki_post, f"/networks/{network_id}/unbind")
-                        do_action(
-                            meraki_post,
-                            f"/networks/{network_id}/bind",
-                            data={"configTemplateId": new_template},
+                            out_unbind = retry_with_backoff(
+                                "lightflow_unbind",
+                                lambda: do_action(meraki_post, f"/networks/{network_id}/unbind"),
+                                max_attempts=4,
+                                base_sleep=1.0,
+                                max_sleep=10.0,
+                                verbose=True,
+                            )
+                            if not out_unbind.ok:
+                                raise RuntimeError(f"Unbind failed: {out_unbind.error}")
+
+                        out_bind = retry_with_backoff(
+                            "lightflow_bind",
+                            lambda: do_action(
+                                meraki_post,
+                                f"/networks/{network_id}/bind",
+                                data={"configTemplateId": new_template},
+                            ),
+                            max_attempts=4,
+                            base_sleep=2.0,
+                            max_sleep=15.0,
+                            verbose=True,
                         )
+                        if not out_bind.ok:
+                            raise RuntimeError(f"Bind failed: {out_bind.error}")
+
                         print(f"✅ Bound to {suggested_tpl.get('name','')}")
 
                         # Re-apply VLANs after (re)bind
@@ -3848,6 +4169,16 @@ if __name__ == '__main__':
         print_vlan_update_summary()
         print_debug_json_log_summary()
         
+        write_run_summary_json(
+            org_id=org_id,
+            network_id=network_id,
+            network_name=network_name,
+            step_status=step_status,
+            claimed_serials=claimed_serials_rb,
+            removed_serials=removed_serials_rb,
+            extra={"path": "A"},
+        )
+     
         maybe_prompt_and_rollback(
             org_id, network_id,
             pre_change_devices, pre_change_vlans, pre_change_template,
@@ -3999,60 +4330,119 @@ if __name__ == '__main__':
         )
 
 
+        # Track per-switch attempts + failures for summary JSON
+    sw_profile_attempts: Dict[str, int] = {}
+    sw_profile_failures: Dict[str, Dict[str, Any]] = {}
+
     for sw in postbind_ms_devices:
-        serial = sw['serial']
+        serial = str(sw.get("serial") or "")
+        if not serial:
+            continue
+
         old_profile_id = ms_serial_to_profileid.get(serial)
         old_profile_name = old_profileid_to_name.get(old_profile_id) if isinstance(old_profile_id, str) else None
 
         # Decide which profile to apply
+        chosen_profile_id: Optional[str] = None
+
         if network_level_profile_id:
-            # CloudStore PreSCE standardisation: apply the chosen profile to all
-            # MS devices that are compatible with it.
             chosen_profile_id = network_level_profile_id
-            # Double-check compatibility; if it doesn't match this model, fall back.
+            # Compatibility check (best-effort)
             if not any(
-                _profile_supports_switch_model(p, sw['model'])
+                _profile_supports_switch_model(p, str(sw.get("model") or ""))
                 for p in tpl_profiles
-                if p.get("switchProfileId") == chosen_profile_id
+                if str(p.get("switchProfileId") or "") == str(chosen_profile_id)
             ):
                 chosen_profile_id = None
-        else:
-            chosen_profile_id = None
 
         if not chosen_profile_id:
-            # Existing behaviour: try to match by original profile name,
-            # otherwise prompt per-model (filtered by 24/48).
             chosen_profile_id = tpl_profile_map.get(old_profile_name) if old_profile_name else None
-            if not chosen_profile_id and tpl_profiles:
-                chosen_profile_id = select_switch_profile_interactive_by_model(
-                    tpl_profiles, tpl_profile_map, sw['model']
-                )
-                if not chosen_profile_id:
-                    continue
 
-        try:
+        if not chosen_profile_id and tpl_profiles:
+            chosen_profile_id = select_switch_profile_interactive_by_model(
+                tpl_profiles, tpl_profile_map, str(sw.get("model") or "")
+            )
+
+        if not chosen_profile_id:
+            logging.warning("No switch profile chosen for %s (%s); skipping", serial, sw.get("model"))
+            continue
+
+        def _op_assign_profile() -> None:
             do_action(meraki_put, f"/devices/{serial}", data={"switchProfileId": chosen_profile_id})
+
+        outcome = retry_with_backoff(
+            f"assign_switch_profile_{serial}",
+            _op_assign_profile,
+            max_attempts=5,
+            base_sleep=1.0,
+            max_sleep=10.0,
+            verbose=True,
+        )
+        sw_profile_attempts[serial] = outcome.attempts
+
+        if outcome.ok:
             log_change(
-                'switch_profile_assign',
+                "switch_profile_assign",
                 f"Assigned switchProfileId {chosen_profile_id} to {serial}",
                 device_serial=serial,
-                device_name=sw.get('name', ''),
-                misc=f"profile_name={old_profile_name or ''}"
+                device_name=str(sw.get("name") or ""),
+                network_id=network_id,
+                network_name=network_name,
+                misc=json.dumps({
+                    "attempts": outcome.attempts,
+                    "profile_name_previous": old_profile_name or "",
+                    "profile_id_assigned": chosen_profile_id,
+                    "switch_model": sw.get("model"),
+                }),
             )
-            time.sleep(2)
 
-            preserved = prebind_overrides_by_serial.get(serial) or (sw.get('port_overrides') or {})
-            if preserved:
-                apply_port_overrides(serial, preserved)
-            else:
-                logging.debug("No port overrides to apply for %s", serial)
+            # Port overrides: best-effort, but still retry individual ports at apply_port_overrides level if you want
+            try:
+                preserved = prebind_overrides_by_serial.get(serial) or (sw.get("port_overrides") or {})
+                if preserved:
+                    apply_port_overrides(serial, preserved)
+            except Exception as e:
+                logging.exception("Failed applying port overrides for %s", serial)
+                sw_profile_failures[serial] = {
+                    "stage": "apply_port_overrides",
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                }
+        else:
+            logging.error("Failed assigning switch profile for %s after %d attempts: %s",
+                          serial, outcome.attempts, outcome.error)
+            sw_profile_failures[serial] = {
+                "stage": "assign_profile",
+                **asdict(outcome),
+                "switch_model": sw.get("model"),
+                "profile_id": chosen_profile_id,
+                "previous_profile_name": old_profile_name,
+            }
 
-        except Exception:
-            logging.exception("Failed to assign profile/apply overrides to %s", serial)
+    # Optionally write a JSON summary for this sub-step (useful when PreSCE mapping goes wrong)
+    try:
+        path = os.path.join("logs", f"switch_profile_assignment_{org_id}_{network_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+        _write_json_log(path, {
+            "timestamp": datetime.now().isoformat(),
+            "org_id": org_id,
+            "network_id": network_id,
+            "network_name": network_name,
+            "attempts_by_switch": sw_profile_attempts,
+            "failures_by_switch": sw_profile_failures,
+        })
+        if DEBUG_MODE:
+            print(f"📝 Switch profile assignment summary saved: {path}")
+    except Exception:
+        logging.exception("Failed writing switch profile assignment summary JSON")
 
-
-    
-
+    if sw_profile_failures:
+        print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print("⚠️ Switch Profile Assignment Issues")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        for ser, info in sw_profile_failures.items():
+            print(f"- {ser}: stage={info.get('stage')} attempts={info.get('attempts')} http={info.get('http_status')} err={info.get('error')}")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+  
     # Wireless pre-check + claim
     safe_to_claim, mr_removed_serials, mr_claimed_serials = run_wireless_precheck_and_filter_claims(
         org_id, network_id, prevalidated_serials
@@ -4248,6 +4638,16 @@ if __name__ == '__main__':
     print_api_error_log_summary()
     print_debug_json_log_summary()
     
+    write_run_summary_json(
+        org_id=org_id,
+        network_id=network_id,
+        network_name=network_name,
+        step_status=step_status,
+        claimed_serials=claimed_serials_rb,
+        removed_serials=removed_serials_rb,
+        extra={"path": "B", "cloudstore_presce_flow": bool(cloudstore_presce)},
+    )
+ 
     # -------- Enhanced rollback prompt (extracted) --------
     maybe_prompt_and_rollback(
         org_id, network_id,
